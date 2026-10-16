@@ -10,7 +10,7 @@ from datetime import datetime
 sys.stdout.reconfigure(encoding='utf-8')
 screenshot_interval = 5
 message_history = []
-history_lock = threading.Lock()  # 🔒 Protect shared history
+history_lock = threading.Lock()  # Protect shared history
 
 
 SYSTEM_PROMPT = """

@@ -1,8 +1,10 @@
 import queue
-import tkinter as tk
 import random
 import os
-from PIL import Image, ImageTk, ImageSequence
+from PIL import Image, ImageSequence
+from PyQt6.QtWidgets import QApplication, QWidget, QLabel
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QImage, QPixmap, QPainter
 import sys
 import threading
 import numpy as np
@@ -18,10 +20,11 @@ _PADDING = np.zeros(int(24000 * 0.3), dtype=np.float32)
 _START_PADDING = np.zeros(int(24000 * 0.05), dtype=np.float32)  # 50ms
 tts_queue = queue.Queue()
 print("Loading XTTS v2...")
-_tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=True)
-_voice = torch.load(_VOICE_PTH)
-_voice["gpt_cond_latent"] = _voice["gpt_cond_latent"].cuda()
-_voice["speaker_embedding"] = _voice["speaker_embedding"].cuda()
+_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+_tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(_DEVICE)
+_voice = torch.load(_VOICE_PTH, map_location=_DEVICE)
+_voice["gpt_cond_latent"] = _voice["gpt_cond_latent"].to(_DEVICE)
+_voice["speaker_embedding"] = _voice["speaker_embedding"].to(_DEVICE)
 _tts_lock = threading.Lock()
 print("TTS ready.")
 
@@ -56,23 +59,34 @@ def synthesize_and_play(text: str):
 # Start TTS worker thread
 threading.Thread(target=tts_worker, daemon=True).start()
 
-class Jinx:
+def pil_to_pixmap(img):
+    img = img.convert("RGBA")
+    qimg = QImage(img.tobytes(), img.width, img.height, QImage.Format.Format_RGBA8888)
+    return QPixmap.fromImage(qimg.copy())
+
+class Jinx(QWidget):
+    message_received = pyqtSignal(str)
+
     def __init__(self):
+        super().__init__()
         self.expression_job = None
-        self.root = tk.Tk()
-        self.root.overrideredirect(True)
-        self.root.wm_attributes("-topmost", True)
-        self.root.config(bg="black")
-        self.root.wm_attributes("-transparentcolor", "black")
+        # Frameless, always-on-top window with a see-through background
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        # Keep showing even though this process is never the active app
+        self.setAttribute(Qt.WidgetAttribute.WA_MacAlwaysShowToolWindow)
         self.drag_reaction_cooldown = 30.0
         self.last_drag_time = 0
         self.is_dragging = False
 
-        self.root.bind("<Escape>", lambda e: self.root.destroy())
-        self.root.bind("<Button-3>", lambda e: self.root.destroy())
-        
         self.pet_width = 300
         self.pet_height = 300
+        self.setFixedSize(self.pet_width, self.pet_height)
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
 
         self.transition_playing = False
@@ -81,35 +95,19 @@ class Jinx:
         self.sleep_job = None
         
 
-        self.canvas = tk.Canvas(
-            self.root,
-            width=self.pet_width,
-            height=self.pet_height,
-            bg="black",
-            highlightthickness=0,
-            bd=0
-        )
-        self.canvas.pack()
-        self.canvas_image = self.canvas.create_image(
-            self.pet_width // 2,
-            self.pet_height // 2,
-            anchor="center"
-        )
-        self.bubble = tk.Label(
-            self.root,
-            text="",
-            bg="#2b2b2b",
-            fg="white",
-            font=("Segoe UI", 10, "bold"),
-            padx=10,
-            pady=5,
-            wraplength=200,
-            justify="center",
-            highlightthickness=1,
-            highlightbackground="#444444"
+        self.photo = None
+        self.bubble = QLabel(self)
+        self.bubble.setWordWrap(True)
+        self.bubble.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.bubble.setStyleSheet(
+            "background-color: #2b2b2b; color: white; font-weight: bold; font-size: 13px;"
+            "padding: 5px 10px; border: 1px solid #444444;"
         )
         # Hide it initially
+        self.bubble.hide()
         self.bubble_visible = False
+        self.bubble_job = None
+        self.message_received.connect(self.show_bubble)
         threading.Thread(target=self.listen_for_messages, daemon=True).start()
         
         self.expressionsBase = [
@@ -162,12 +160,9 @@ class Jinx:
             img = Image.open(path).convert("RGBA")
             img = img.resize((self.pet_width, self.pet_height), Image.LANCZOS)
 
-            self.preloaded_images[path] = ImageTk.PhotoImage(img)
+            self.preloaded_images[path] = pil_to_pixmap(img)
 
         self.old_pos = None
-        self.canvas.bind("<ButtonPress-1>", self.mouse_press)
-        self.canvas.bind("<B1-Motion>", self.mouse_move)
-        self.canvas.bind("<ButtonRelease-1>", self.mouse_release)
 
         self.currentBaseCollection = self.expressionsBase
         self.currentBlinkImage = self.expressionBaseClosed
@@ -180,6 +175,29 @@ class Jinx:
         self.blink()
         self.reset_sleep_timer()
 
+    # ── Timer helpers (stand-ins for Tk's after/after_cancel) ──────────────────
+    def after(self, ms, func, *args):
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda: func(*args))
+        timer.timeout.connect(timer.deleteLater)
+        timer.start(ms)
+        return timer
+
+    def after_cancel(self, timer):
+        try:
+            timer.stop()
+        except RuntimeError:
+            pass  # timer already fired and was deleted
+
+    def set_frame(self, pixmap):
+        self.photo = pixmap
+        self.update()
+
+    def paintEvent(self, event):
+        if self.photo:
+            QPainter(self).drawPixmap(0, 0, self.photo)
+
     def load_gif(self, path):
         gif = Image.open(path)
 
@@ -189,7 +207,7 @@ class Jinx:
             frame = frame.convert("RGBA")
             frame = frame.resize((self.pet_width, self.pet_height), Image.LANCZOS)
 
-            frames.append(ImageTk.PhotoImage(frame))
+            frames.append(pil_to_pixmap(frame))
 
         delay = gif.info.get("duration", 100)
 
@@ -208,10 +226,9 @@ class Jinx:
 
         def animate(index=0):
             if index < len(frames):
-                self.canvas.itemconfig(self.canvas_image, image=frames[index])
-                self.photo = frames[index]
+                self.set_frame(frames[index])
 
-                self.root.after(delay, animate, index + 1)
+                self.after(delay, animate, index + 1)
 
             else:
                 self.transition_playing = False
@@ -227,12 +244,12 @@ class Jinx:
     def reset_sleep_timer(self):
         # Cancel previous timer
         if self.sleep_job:
-            self.root.after_cancel(self.sleep_job)
+            self.after_cancel(self.sleep_job)
         # Wake up if currently sleeping
         if self.is_sleeping:
             self.wake_up()
         # Start new inactivity countdown
-        self.sleep_job = self.root.after(
+        self.sleep_job = self.after(
             self.sleep_after,
             self.go_to_sleep
         )
@@ -268,37 +285,42 @@ class Jinx:
         for line in sys.stdin:
             message = line.strip()
             if message:
-                # Use after() to update UI from a background thread
-                self.root.after(0, self.show_bubble, message)
+                # Hand off to the UI thread via a Qt signal
+                self.message_received.emit(message)
 
     def show_bubble(self, text):
-        self.bubble.config(text=text)
+        self.bubble.setText(text)
         # Position bubble above the pet's head
-        self.bubble.place(x=25, y=10, width=200) 
+        self.bubble.setFixedWidth(200)
+        self.bubble.adjustSize()
+        self.bubble.move(25, 10)
+        self.bubble.show()
+        self.bubble.raise_()
         self.bubble_visible = True
         speak_async(text)
-        # Auto-hide after 15 seconds
-        self.root.after(20000, self.hide_bubble)
+        # Auto-hide after 20 seconds
+        if self.bubble_job:
+            self.after_cancel(self.bubble_job)
+        self.bubble_job = self.after(20000, self.hide_bubble)
 
     def hide_bubble(self):
         if self.bubble_visible:
-            self.bubble.place_forget()
+            self.bubble.hide()
             self.bubble_visible = False
 
     def move_to_bottom_left(self):
-        sh = self.root.winfo_screenheight()
-        self.root.geometry(f"+20+{sh - self.pet_height - 20}")
+        sh = QApplication.primaryScreen().geometry().height()
+        self.move(20, sh - self.pet_height - 20)
 
     def update_image(self, path):
-        self.photo = self.preloaded_images[path]
-        self.canvas.itemconfig(self.canvas_image, image=self.photo)
+        self.set_frame(self.preloaded_images[path])
 
     #new expression logic
     def new_schedule_expression(self):
         if self.expression_job:
-            self.root.after_cancel(self.expression_job)
+            self.after_cancel(self.expression_job)
 
-        self.expression_job = self.root.after(
+        self.expression_job = self.after(
             2000,
             self.change_expressionV2
         )
@@ -400,31 +422,42 @@ class Jinx:
 
     def blink(self):
         if self.transition_playing or self.is_dragging or self.is_sleeping:
-            self.root.after(1000, self.blink) # Check again after 1 second
+            self.after(1000, self.blink) # Check again after 1 second
             return
         # close eyes
         self.update_image(self.currentBlinkImage)
 
         # reopen after short delay
-        self.root.after(
+        self.after(
             200,
             lambda: self.update_image(random.choice(self.currentBaseCollection))
         )
 
         # schedule next blink randomly
         next_blink = random.randint(3000, 7000)
-        self.root.after(next_blink, self.blink)
+        self.after(next_blink, self.blink)
 
 
 
-    def mouse_press(self, event):
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            QApplication.quit()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.RightButton:
+            QApplication.quit()
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
         self.reset_sleep_timer()
         self.is_dragging = False
-        self.old_pos = (event.x_root, event.y_root)
+        pos = event.globalPosition().toPoint()
+        self.old_pos = (pos.x(), pos.y())
 
-    def mouse_move(self, event):
+    def mouseMoveEvent(self, event):
         self.reset_sleep_timer()
         if self.old_pos:
+            pos = event.globalPosition().toPoint()
             current_time = time.time()
             # Only signal Electron if we haven't already reported this drag session
             if not self.is_dragging :
@@ -437,14 +470,14 @@ class Jinx:
                     self.last_drag_time = current_time
                     self.is_dragging = True
                 
-            dx = event.x_root - self.old_pos[0]
-            dy = event.y_root - self.old_pos[1]
-            x = self.root.winfo_x() + dx
-            y = self.root.winfo_y() + dy
-            self.root.geometry(f"+{x}+{y}")
-            self.old_pos = (event.x_root, event.y_root)
+            dx = pos.x() - self.old_pos[0]
+            dy = pos.y() - self.old_pos[1]
+            self.move(self.x() + dx, self.y() + dy)
+            self.old_pos = (pos.x(), pos.y())
 
-    def mouse_release(self, event):
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton or self.old_pos is None:
+            return
         self.reset_sleep_timer()
         self.old_pos = None
         self.is_dragging = False
@@ -460,8 +493,10 @@ class Jinx:
         self.new_schedule_expression() # Resume normal expression changes
 
     def run(self):
-        self.root.mainloop()
+        self.show()
+        QApplication.instance().exec()
 
 if __name__ == "__main__":
+    app = QApplication(sys.argv)
     pet = Jinx()
     pet.run()
